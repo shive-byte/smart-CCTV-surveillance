@@ -1,0 +1,21 @@
+CREATE SEQUENCE user_id_seq
+START WITH 1
+INCREMENT BY 1;
+
+CREATE TABLE users (
+    id VARCHAR(10) PRIMARY KEY,
+
+    name VARCHAR(100) NOT NULL,
+
+    username VARCHAR(50) UNIQUE NOT NULL,
+
+    password_hash TEXT NOT NULL,
+
+    role user_role NOT NULL DEFAULT 'worker',
+
+    is_active BOOLEAN NOT NULL DEFAULT TRUE,
+
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
