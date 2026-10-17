@@ -38,7 +38,7 @@ def list_events(
     conn = get_connection()
     query = """
         SELECT
-            e.id, e.camera_id, e.event_type, e.severity, e.event_status,
+            e.id, e.camera_id, e.event_type, e.severity,
             e.temperature, e.humidity, e.voltage, e.dust, e.vibration, e.light,
             e.prediction, e.image_path, e.description, e.created_at, e.updated_at,
             c.device_id, c.location
@@ -77,20 +77,20 @@ def list_events(
             "camera_id": r[1],
             "event_type": r[2],
             "severity": r[3],
-            "event_status": r[4],
-            "temperature": r[5],
-            "humidity": r[6],
-            "voltage": r[7],
-            "dust": r[8],
-            "vibration": r[9],
-            "light": r[10],
-            "prediction": r[11],
-            "image_path": r[12],
-            "description": r[13],
-            "created_at": r[14],
-            "updated_at": r[15],
-            "device_id": r[16],
-            "location": r[17],
+           
+            "temperature": r[4],
+            "humidity": r[5],
+            "voltage": r[6],
+            "dust": r[7],
+            "vibration": r[8],
+            "light": r[9],
+            "prediction": r[10],
+            "image_path": r[11],
+            "description": r[12],
+            "created_at": r[13],
+            "updated_at": r[14],
+            "device_id": r[15],
+            "location": r[16],
         }
         for r in rows
     ]

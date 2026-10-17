@@ -56,11 +56,15 @@ def list_maintenance(
     current_user: dict = Depends(require_role("admin", "operator", "worker")),
 ):
     conn = get_connection()
+    print(current_user)
+    print(status)
+    print(camera_id)
+    print('hello')
     query = """
         SELECT
             m.id, m.camera_id, m.event_id, m.maintenance_type, m.recommendation,
             m.status, m.performed_by, m.maintenance_date, m.next_maintenance, m.remarks,
-            m.created_at, m.updated_at,
+            m.created_at,
             c.device_id, c.location,
             u.name AS performed_by_name
         FROM maintenance_records m

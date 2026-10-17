@@ -12,14 +12,46 @@ from app.maintenance import router as maintenance_router
 from app.notifications import router as notifications_router
 from app.dashboard import router as dashboard_router
 from app.audit import router as audit_router
-from app.websocket import router as ws_router
+
 from app.config import UPLOAD_FOLDER
+import asyncio
+
+from contextlib import asynccontextmanager
+from fastapi import FastAPI
+
+from app.websocket import router as ws_router, heartbeat_loop
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+
+    print("Starting heartbeat service...")
+
+    heartbeat_task = asyncio.create_task(
+        heartbeat_loop()
+    )
+
+    yield
+
+    print("Stopping heartbeat service...")
+
+    heartbeat_task.cancel()
+
+    try:
+        await heartbeat_task
+    except asyncio.CancelledError:
+        pass
+
+
+
+
 
 # ---------------------------------------------------------------------------
 # Application
 # ---------------------------------------------------------------------------
 
 app = FastAPI(
+    lifespan=lifespan,
     title="SentinelAI API",
     version="1.0.0",
     description=(

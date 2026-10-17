@@ -35,9 +35,9 @@ def get_summary(
         cur.execute(
             """
             SELECT
-                COUNT(*) FILTER (WHERE event_status = 'DETECTED')     AS open_events,
+                COUNT(*) FILTER (WHERE event_type = 'DETECTED')     AS open_events,
                 COUNT(*) FILTER (WHERE severity     = 'CRITICAL')     AS critical_events,
-                COUNT(*) FILTER (WHERE event_status = 'ACKNOWLEDGED') AS acknowledged,
+                COUNT(*) FILTER (WHERE event_type = 'ACKNOWLEDGED') AS acknowledged,
                 COUNT(*)                                               AS total_events
             FROM events
             """

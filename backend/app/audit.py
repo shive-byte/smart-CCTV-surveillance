@@ -22,6 +22,7 @@ def list_audit_logs(
     JWT required — admin role only.
     """
     conn = get_connection()
+    print(conn)
     query = """
         SELECT
             a.id, a.user_id, a.action, a.entity_type, a.entity_id,
