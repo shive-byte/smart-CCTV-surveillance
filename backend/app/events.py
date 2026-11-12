@@ -21,6 +21,105 @@ class UpdateEventStatusRequest(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Alert Ingestion Helper (Used when an alert arrives from a camera)
+# ---------------------------------------------------------------------------
+
+def record_camera_alert(
+    camera_id: int,
+    event_type: str,
+    severity: str,
+    temperature: Optional[float] = None,
+    humidity: Optional[float] = None,
+    voltage: Optional[float] = None,
+    dust: Optional[float] = None,
+    vibration: Optional[float] = None,
+    light: Optional[float] = None,
+    water_level: Optional[float] = None,
+    current_ma: Optional[float] = None,
+    power_mw: Optional[float] = None,
+    tilt: Optional[float] = None,
+    prediction: Optional[str] = None,
+    image_path: Optional[str] = None,
+    description: Optional[str] = None,
+) -> int:
+    """
+    Called whenever an alert is received from a camera:
+    - If camera_id already exists in events table: updates the status and sensor columns including updated_at.
+    - If camera_id does not exist: inserts as a new row.
+    - Also updates camera status in the cameras table.
+    Returns the event id.
+    """
+    conn = get_connection()
+    with conn.cursor() as cur:
+        # Check if camera_id already exists in events table
+        cur.execute("SELECT id FROM events WHERE camera_id = %s ORDER BY id DESC LIMIT 1", (camera_id,))
+        existing = cur.fetchone()
+
+        if existing:
+            event_id = existing[0]
+            cur.execute(
+                """
+                UPDATE events SET
+                    event_type = %s,
+                    severity = %s,
+                    event_status = 'DETECTED',
+                    temperature = %s,
+                    humidity = %s,
+                    voltage = %s,
+                    dust = %s,
+                    vibration = %s,
+                    light = %s,
+                    water_level = %s,
+                    current_ma = %s,
+                    power_mw = %s,
+                    tilt = %s,
+                    prediction = %s,
+                    image_path = %s,
+                    description = %s,
+                    updated_at = NOW()
+                WHERE id = %s
+                """,
+                (
+                    event_type, severity,
+                    temperature, humidity, voltage, dust, vibration, light,
+                    water_level, current_ma, power_mw, tilt,
+                    prediction, image_path, description,
+                    event_id,
+                ),
+            )
+        else:
+            cur.execute(
+                """
+                INSERT INTO events (
+                    camera_id, event_type, severity, event_status,
+                    temperature, humidity, voltage, dust, vibration, light,
+                    water_level, current_ma, power_mw, tilt,
+                    prediction, image_path, description,
+                    created_at, updated_at
+                )
+                VALUES (%s, %s, %s, 'DETECTED', %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW())
+                RETURNING id
+                """,
+                (
+                    camera_id, event_type, severity,
+                    temperature, humidity, voltage, dust, vibration, light,
+                    water_level, current_ma, power_mw, tilt,
+                    prediction, image_path, description,
+                ),
+            )
+            event_id = cur.fetchone()[0]
+
+        # Update camera status in cameras table
+        cam_status = "error" if severity in ("CRITICAL", "HIGH") else "online"
+        cur.execute(
+            "UPDATE cameras SET status = %s, updated_at = NOW() WHERE id = %s",
+            (cam_status, camera_id),
+        )
+    conn.commit()
+    return event_id
+
+
+# ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
 
@@ -41,7 +140,9 @@ def list_events(
             e.id, e.camera_id, e.event_type, e.severity,
             e.temperature, e.humidity, e.voltage, e.dust, e.vibration, e.light,
             e.prediction, e.image_path, e.description, e.created_at, e.updated_at,
-            c.device_id, c.location
+            c.device_id, c.location,
+            e.water_level, e.current_ma, e.power_mw, e.tilt,
+            e.event_status
         FROM events e
         JOIN cameras c ON e.camera_id = c.id
         WHERE 1=1
@@ -77,7 +178,6 @@ def list_events(
             "camera_id": r[1],
             "event_type": r[2],
             "severity": r[3],
-           
             "temperature": r[4],
             "humidity": r[5],
             "voltage": r[6],
@@ -91,6 +191,11 @@ def list_events(
             "updated_at": r[14],
             "device_id": r[15],
             "location": r[16],
+            "water_level": r[17],
+            "current_ma": r[18],
+            "power_mw": r[19],
+            "tilt": r[20],
+            "event_status": r[21] if len(r) > 21 and r[21] else "DETECTED",
         }
         for r in rows
     ]
@@ -109,7 +214,8 @@ def get_event(
                 e.id, e.camera_id, e.event_type, e.severity, e.event_status,
                 e.temperature, e.humidity, e.voltage, e.dust, e.vibration, e.light,
                 e.prediction, e.image_path, e.description, e.created_at, e.updated_at,
-                c.device_id, c.location
+                c.device_id, c.location,
+                e.water_level, e.current_ma, e.power_mw, e.tilt
             FROM events e
             JOIN cameras c ON e.camera_id = c.id
             WHERE e.id = %s
@@ -140,6 +246,10 @@ def get_event(
         "updated_at": row[15],
         "device_id": row[16],
         "location": row[17],
+        "water_level": row[18],
+        "current_ma": row[19],
+        "power_mw": row[20],
+        "tilt": row[21],
     }
 
 
@@ -149,7 +259,8 @@ def update_event_status(
     body: UpdateEventStatusRequest,
     current_user: dict = Depends(require_role("admin", "operator", "worker")),
 ):
-    if body.event_status.upper() not in VALID_STATUSES:
+    status_val = body.event_status.upper()
+    if status_val not in VALID_STATUSES:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Invalid event_status. Must be one of {list(VALID_STATUSES)}",
@@ -157,23 +268,39 @@ def update_event_status(
 
     conn = get_connection()
     with conn.cursor() as cur:
-        cur.execute(
-            "UPDATE events SET event_status = %s WHERE id = %s RETURNING id",
-            (body.event_status.upper(), event_id),
-        )
+        # Check if event exists and get its camera_id
+        cur.execute("SELECT camera_id FROM events WHERE id = %s", (event_id,))
         row = cur.fetchone()
-    conn.commit()
+        if not row:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Event not found")
+        camera_id = row[0]
 
-    if not row:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Event not found")
+        # Update event_status (keep row, only change event_status)
+        cur.execute(
+            "UPDATE events SET event_status = %s, updated_at = NOW() WHERE id = %s RETURNING id",
+            (status_val, event_id),
+        )
+        updated_row = cur.fetchone()
 
-    log_audit(
-        current_user["id"],
-        f"EVENT_{body.event_status.upper()}",
-        "events",
-        event_id,
-    )
-    return {"message": f"Event marked as {body.event_status.upper()}", "id": row[0]}
+        # If resolved, reset camera status in cameras table to 'online'
+        if status_val == "RESOLVED":
+            cur.execute("UPDATE cameras SET status = 'online', updated_at = NOW() WHERE id = %s", (camera_id,))
+
+        conn.commit()
+
+        log_audit(
+            current_user["id"],
+            f"EVENT_{status_val}",
+            "events",
+            event_id,
+            {"camera_id": camera_id, "event_status": status_val},
+        )
+        return {
+            "message": f"Event marked as {status_val}",
+            "id": updated_row[0],
+            "camera_id": camera_id,
+            "event_status": status_val,
+        }
 
 
 @router.delete("/{event_id}", summary="Delete an event (admin only)")

@@ -31,7 +31,7 @@ class UpdateCameraRequest(BaseModel):
 
 
 class TelemetryPayload(BaseModel):
-    """Payload sent by an ESP32 device."""
+    """Payload sent by an ESP32 device or telemetry bridge."""
     device_id: str
     temperature: Optional[float] = None
     humidity: Optional[float] = None
@@ -39,6 +39,19 @@ class TelemetryPayload(BaseModel):
     dust: Optional[float] = None
     vibration: Optional[float] = None
     light: Optional[float] = None
+    current_ma: Optional[float] = None
+    power_mw: Optional[float] = None
+    water_level: Optional[float] = None
+    tilt: Optional[float] = None
+    pitch: Optional[float] = None
+    roll: Optional[float] = None
+    shock: Optional[bool] = None
+    status_power: Optional[str] = None
+    status_temp: Optional[str] = None
+    status_water: Optional[str] = None
+    status_tamper: Optional[str] = None
+    overall: Optional[str] = None
+    ip_address: Optional[str] = None
     prediction: Optional[str] = None
     image_path: Optional[str] = None
 
@@ -294,77 +307,244 @@ async def receive_telemetry(
     """
     conn = get_connection()
 
-    # --- Resolve camera ---
+    # --- Sanitize IP address for PostgreSQL INET column ---
+    valid_ip = None
+    if body.ip_address:
+        clean_ip = str(body.ip_address).strip().strip("'\"")
+        if clean_ip.lower() not in ("offline", "none", "null", ""):
+            try:
+                import ipaddress
+                ipaddress.ip_address(clean_ip)
+                valid_ip = clean_ip
+            except ValueError:
+                valid_ip = None
+
+    # --- Resolve camera (auto-register if not yet created) ---
     with conn.cursor() as cur:
         cur.execute("SELECT id FROM cameras WHERE device_id = %s", (body.device_id,))
         row = cur.fetchone()
     if not row:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Camera with device_id '{body.device_id}' is not registered",
-        )
-    camera_id = row[0]
+        with conn.cursor() as cur:
+            cur.execute("SELECT id FROM users ORDER BY created_at ASC LIMIT 1")
+            user_row = cur.fetchone()
+            op_id = user_row[0] if user_row else "TN001"
+            cur.execute(
+                """
+                INSERT INTO cameras (device_id, location, ip_address, operator_id, status)
+                VALUES (%s, %s, %s, %s, 'online')
+                RETURNING id
+                """,
+                (body.device_id, "Hardware CCTV Node", valid_ip, op_id),
+            )
+            camera_id = cur.fetchone()[0]
+        conn.commit()
+    else:
+        camera_id = row[0]
 
-    # --- Compute health score (simple rule-based degradation) ---
+    # --- Compute health score based on hardware sensors (main.ino) ---
     health = 100.0
+
+    # 1. Power (INA219)
+    if body.status_power == "FAULT":
+        health -= 35.0
+    elif body.status_power == "WARN":
+        health -= 15.0
+    elif body.voltage is not None:
+        if body.voltage > 8.0:  # 12V CCTV system
+            if body.voltage < 11.0 or body.voltage > 14.0:
+                health -= 30.0
+            elif body.voltage < 11.5 or body.voltage > 13.5:
+                health -= 15.0
+        else:  # 5V simulator
+            if body.voltage < 4.5 or body.voltage > 5.5:
+                health -= 25.0
+
+    if body.current_ma is not None:
+        if body.current_ma < 20.0:
+            health -= 40.0
+        elif body.current_ma > 1200.0:
+            health -= 35.0
+        elif body.current_ma > 900.0:
+            health -= 15.0
+
+    # 2. Temperature (DS18B20)
+    if body.status_temp == "FAULT":
+        health -= 35.0
+    elif body.status_temp == "WARN":
+        health -= 15.0
+    elif body.temperature is not None:
+        if body.temperature < -100 or body.temperature >= 70.0:
+            health -= 35.0
+        elif body.temperature >= 60.0:
+            health -= 15.0
+
+    # 3. Water Ingress (Water level sensor: ~4068 is normal baseline; only alert if >4100 or >4200 as minor issue)
+    if body.water_level is not None:
+        if body.water_level >= 4200:
+            health -= 15.0  # Minor issue
+        elif body.water_level >= 4100:
+            health -= 8.0   # Minor issue
+    elif body.status_water == "FAULT":
+        health -= 15.0
+    elif body.status_water == "WARN":
+        health -= 8.0
+
+    # 4. Tamper / Tilt / Shock (MPU6050)
+    if body.status_tamper == "FAULT" or body.shock:
+        health -= 35.0
+    elif body.status_tamper == "WARN":
+        health -= 15.0
+    elif body.tilt is not None:
+        if body.tilt >= 15.0:
+            health -= 30.0
+        elif body.tilt >= 7.0:
+            health -= 15.0
+
+    # 5. Legacy / Environmental
     if body.dust is not None:
-        health -= body.dust / 10.0          # -10 pts per 100 units dust
-    if body.vibration is not None:
-        health -= body.vibration * 5.0      # -5 pts per vibration unit
-    health = max(0.0, min(100.0, health))
+        health -= body.dust / 10.0
+    if body.vibration is not None and body.vibration > 1.6:
+        health -= 20.0
+
+    # Overall firmware state override
+    if body.overall == "CRITICAL":
+        health = min(health, 35.0)
+    elif body.overall == "WARNING":
+        health = min(health, 65.0)
+
+    health = round(max(0.0, min(100.0, health)), 2)
+
+    # --- Update camera status, health & IP ---
+    update_fields = ["last_seen = NOW()", "status = 'online'", "health_score = %s"]
+    update_params = [health]
+    if valid_ip:
+        update_fields.append("ip_address = %s")
+        update_params.append(valid_ip)
+    update_params.append(camera_id)
 
     with conn.cursor() as cur:
         cur.execute(
-            "UPDATE cameras SET last_seen = NOW(), status = 'online', health_score = %s WHERE id = %s",
-            (health, camera_id),
+            f"UPDATE cameras SET {', '.join(update_fields)} WHERE id = %s",
+            tuple(update_params),
         )
     conn.commit()
 
-    # --- Anomaly detection ---
+    # --- Anomaly detection & event description ---
     severity = "LOW"
     description_parts: list[str] = []
 
-    if body.temperature is not None and body.temperature > 60:
-        severity = _max_severity(severity, "HIGH")
-        description_parts.append(f"High temperature: {body.temperature}°C")
+    # Power checks
+    if body.voltage is not None:
+        if body.voltage > 8.0:
+            if body.voltage < 11.0:
+                severity = _max_severity(severity, "CRITICAL")
+                description_parts.append(f"Critical CCTV undervoltage: {body.voltage:.2f}V (min: 11.0V)")
+            elif body.voltage > 13.5:
+                severity = _max_severity(severity, "HIGH")
+                description_parts.append(f"Overvoltage warning: {body.voltage:.2f}V (max: 13.5V)")
+            elif body.voltage < 11.5:
+                severity = _max_severity(severity, "MEDIUM")
+                description_parts.append(f"Low voltage warning: {body.voltage:.2f}V")
+        else:
+            if body.voltage < 4.5 or body.voltage > 5.5:
+                severity = _max_severity(severity, "CRITICAL")
+                description_parts.append(f"Voltage out of range: {body.voltage:.2f}V")
 
+    if body.current_ma is not None:
+        if body.current_ma < 20.0:
+            severity = _max_severity(severity, "CRITICAL")
+            description_parts.append(f"Camera offline/unpowered ({body.current_ma:.0f}mA)")
+        elif body.current_ma > 1200.0:
+            severity = _max_severity(severity, "CRITICAL")
+            description_parts.append(f"Overcurrent trip: {body.current_ma:.0f}mA")
+        elif body.current_ma > 900.0:
+            severity = _max_severity(severity, "HIGH")
+            description_parts.append(f"High current draw: {body.current_ma:.0f}mA")
+
+    # Temp checks
+    if body.temperature is not None:
+        if body.temperature < -100:
+            severity = _max_severity(severity, "CRITICAL")
+            description_parts.append("DS18B20 temperature probe disconnected")
+        elif body.temperature >= 70.0:
+            severity = _max_severity(severity, "CRITICAL")
+            description_parts.append(f"Severe camera housing overheating: {body.temperature:.1f}°C")
+        elif body.temperature >= 60.0:
+            severity = _max_severity(severity, "HIGH")
+            description_parts.append(f"High temperature: {body.temperature:.1f}°C")
+
+    # Water ingress (~4068 is normal baseline; only alert if above 4100 or 4200 as minor issue)
+    if body.water_level is not None:
+        if body.water_level >= 4200:
+            severity = _max_severity(severity, "MEDIUM")
+            description_parts.append(f"Minor water level alert: ADC {int(body.water_level)} (threshold 4200)")
+        elif body.water_level >= 4100:
+            severity = _max_severity(severity, "LOW")
+            description_parts.append(f"Minor moisture rise: ADC {int(body.water_level)} (threshold 4100)")
+
+    # Tamper / Tilt / Shock
+    if body.shock:
+        severity = _max_severity(severity, "CRITICAL")
+        description_parts.append("Tamper alert: Physical impact/shock detected!")
+    if body.tilt is not None:
+        if body.tilt >= 15.0:
+            severity = _max_severity(severity, "CRITICAL")
+            description_parts.append(f"Camera displacement fault: {body.tilt:.1f}° from baseline")
+        elif body.tilt >= 7.0:
+            severity = _max_severity(severity, "HIGH")
+            description_parts.append(f"Camera shifted: {body.tilt:.1f}° tilt from baseline")
+
+    # Environmental
     if body.humidity is not None and body.humidity > 80:
         severity = _max_severity(severity, "MEDIUM")
         description_parts.append(f"High humidity: {body.humidity}%")
 
-    if body.voltage is not None and (body.voltage < 4.5 or body.voltage > 5.5):
-        severity = _max_severity(severity, "CRITICAL")
-        description_parts.append(f"Voltage out of range: {body.voltage}V")
-
     if health < 40:
         severity = _max_severity(severity, "HIGH")
-        description_parts.append(f"Low health score: {health:.1f}")
+        description_parts.append(f"Degraded health score: {health:.1f}%")
 
-    event_type = body.prediction or ("anomaly_detected" if description_parts else "telemetry")
+    # Auto classify event type
+    if body.prediction:
+        event_type = body.prediction
+    elif body.shock:
+        event_type = "shock_impact"
+    elif body.tilt and body.tilt >= 7.0:
+        event_type = "tamper_tilt"
+    elif body.water_level and body.water_level >= 4100:
+        event_type = "water_level_minor"
+    elif body.temperature and body.temperature >= 60.0:
+        event_type = "overheating"
+    elif body.current_ma and body.current_ma < 20.0:
+        event_type = "camera_offline"
+    elif description_parts:
+        event_type = "anomaly_detected"
+    else:
+        event_type = "telemetry"
+
     description = "; ".join(description_parts) if description_parts else None
 
-    # --- Create event & notification only when something is noteworthy ---
+    # --- Create or update event & notification when anomaly or prediction occurs ---
     event_id = None
     if description_parts or body.prediction:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO events (
-                    camera_id, event_type, severity,
-                    temperature, humidity, voltage, dust, vibration, light,
-                    prediction, image_path, description
-                )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                RETURNING id
-                """,
-                (
-                    camera_id, event_type, severity,
-                    body.temperature, body.humidity, body.voltage,
-                    body.dust, body.vibration, body.light,
-                    body.prediction, body.image_path, description,
-                ),
-            )
-            event_id = cur.fetchone()[0]
+        from app.events import record_camera_alert
+        event_id = record_camera_alert(
+            camera_id=camera_id,
+            event_type=event_type,
+            severity=severity,
+            temperature=body.temperature,
+            humidity=body.humidity,
+            voltage=body.voltage,
+            dust=body.dust,
+            vibration=body.vibration,
+            light=body.light,
+            water_level=body.water_level,
+            current_ma=body.current_ma,
+            power_mw=body.power_mw,
+            tilt=body.tilt,
+            prediction=body.prediction,
+            image_path=body.image_path,
+            description=description,
+        )
 
         notif_title = f"[{severity}] {event_type.replace('_', ' ').title()}"
         notif_msg = description or f"ML Prediction: {body.prediction}"
@@ -381,7 +561,7 @@ async def receive_telemetry(
             notif = cur.fetchone()
         conn.commit()
 
-        # Broadcast to all WebSocket subscribers
+        # Broadcast notification to all WebSocket subscribers
         await manager.broadcast(
             {
                 "type": "notification",
@@ -394,6 +574,25 @@ async def receive_telemetry(
                 "created_at": str(notif[4]),
             }
         )
+
+    # Broadcast live telemetry packet so dashboard charts/status update in real-time
+    await manager.broadcast(
+        {
+            "type": "telemetry",
+            "camera_id": camera_id,
+            "device_id": body.device_id,
+            "voltage": body.voltage,
+            "current_ma": body.current_ma,
+            "power_mw": body.power_mw,
+            "temperature": body.temperature,
+            "water_level": body.water_level,
+            "tilt": body.tilt,
+            "shock": body.shock,
+            "health_score": health,
+            "overall": body.overall or ("HEALTHY" if health >= 80 else "WARNING" if health >= 50 else "CRITICAL"),
+            "status": "online",
+        }
+    )
 
     return {
         "status": "ok",

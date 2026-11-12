@@ -17,7 +17,7 @@ const state = {
   cameraFilter: "all",
   cameraSearch: "",
   eventSeverityFilter: "all",
-  eventStatusFilter: "all",
+  eventStatusFilter: "unresolved",
   socketStatus: "disconnected",
 };
 
@@ -566,24 +566,28 @@ function renderDashboardContent() {
               </thead>
               <tbody>
                 ${
-                  state.events.length === 0
-                    ? `<tr><td colspan="4" style="text-align: center; color: var(--text-muted); padding: 2rem;">No incidents detected. Fleet running healthy.</td></tr>`
-                    : state.events
-                        .slice(0, 5)
-                        .map(
-                          (ev) => `
-                      <tr>
-                        <td>
-                          <strong>${escapeHtml(ev.device_id || `Cam #${ev.camera_id}`)}</strong>
-                          <div style="font-size: 0.7rem; color: var(--text-muted);">${escapeHtml(ev.location || "")}</div>
-                        </td>
-                        <td><span class="badge badge-${(ev.severity || "LOW").toLowerCase()}">${ev.severity}</span></td>
-                        <td>${escapeHtml(ev.event_type)}</td>
-                        <td><span class="badge badge-${(ev.event_status || "DETECTED").toLowerCase()}">${ev.event_status}</span></td>
-                      </tr>
-                    `
-                        )
-                        .join("")
+                  (() => {
+                    const unresolvedEvents = state.events.filter((e) => (e.event_status || "DETECTED").toUpperCase() !== "RESOLVED");
+                    if (unresolvedEvents.length === 0) {
+                      return `<tr><td colspan="4" style="text-align: center; color: var(--text-muted); padding: 2rem;">No active incidents detected. Fleet running healthy.</td></tr>`;
+                    }
+                    return unresolvedEvents
+                      .slice(0, 5)
+                      .map(
+                        (ev) => `
+                        <tr>
+                          <td>
+                            <strong>${escapeHtml(ev.device_id || `Cam #${ev.camera_id}`)}</strong>
+                            <div style="font-size: 0.7rem; color: var(--text-muted);">${escapeHtml(ev.location || "")}</div>
+                          </td>
+                          <td><span class="badge badge-${(ev.severity || "LOW").toLowerCase()}">${ev.severity}</span></td>
+                          <td>${escapeHtml(ev.event_type)}</td>
+                          <td><span class="badge badge-${(ev.event_status || "DETECTED").toLowerCase()}">${ev.event_status}</span></td>
+                        </tr>
+                      `
+                      )
+                      .join("");
+                  })()
                 }
               </tbody>
             </table>
@@ -763,7 +767,15 @@ function renderCamerasContent() {
 function renderEventsContent() {
   const filteredEvents = state.events.filter((ev) => {
     const matchSev = state.eventSeverityFilter === "all" || (ev.severity || "").toUpperCase() === state.eventSeverityFilter.toUpperCase();
-    const matchStatus = state.eventStatusFilter === "all" || (ev.event_status || "").toUpperCase() === state.eventStatusFilter.toUpperCase();
+    const st = (ev.event_status || "DETECTED").toUpperCase();
+    let matchStatus = true;
+    if (state.eventStatusFilter === "unresolved") {
+      matchStatus = st !== "RESOLVED";
+    } else if (state.eventStatusFilter === "all") {
+      matchStatus = true;
+    } else {
+      matchStatus = st === state.eventStatusFilter.toUpperCase();
+    }
     return matchSev && matchStatus;
   });
 
@@ -782,10 +794,11 @@ function renderEventsContent() {
 
           <!-- Status Filter -->
           <div style="display: flex; gap: 0.25rem; background: var(--bg-surface); padding: 3px; border-radius: var(--radius-md); border: 1px solid var(--border-subtle);">
-            <button class="btn-chip ${state.eventStatusFilter === "all" ? "active" : ""}" data-ev-stat="all">All Statuses</button>
+            <button class="btn-chip ${state.eventStatusFilter === "unresolved" ? "active" : ""}" data-ev-stat="unresolved">Active (Unresolved)</button>
             <button class="btn-chip ${state.eventStatusFilter === "DETECTED" ? "active" : ""}" data-ev-stat="DETECTED">Detected</button>
             <button class="btn-chip ${state.eventStatusFilter === "ACKNOWLEDGED" ? "active" : ""}" data-ev-stat="ACKNOWLEDGED">Acknowledged</button>
-            <button class="btn-chip ${state.eventStatusFilter === "RESOLVED" ? "active" : ""}" data-ev-stat="RESOLVED">Resolved</button>
+            <button class="btn-chip ${state.eventStatusFilter === "RESOLVED" ? "active" : ""}" data-ev-stat="RESOLVED">Resolved History</button>
+            <button class="btn-chip ${state.eventStatusFilter === "all" ? "active" : ""}" data-ev-stat="all">All</button>
           </div>
         </div>
       </div>
@@ -824,8 +837,11 @@ function renderEventsContent() {
                       <td>
                         <div class="sensor-chips">
                           ${ev.temperature != null ? `<span class="sensor-chip">${icons.thermometer} ${ev.temperature}°C</span>` : ""}
-                          ${ev.humidity != null ? `<span class="sensor-chip">${icons.droplet} ${ev.humidity}%</span>` : ""}
                           ${ev.voltage != null ? `<span class="sensor-chip">${icons.zap} ${ev.voltage}V</span>` : ""}
+                          ${ev.current_ma != null ? `<span class="sensor-chip">${icons.zap} ${ev.current_ma}mA</span>` : ""}
+                          ${ev.water_level != null ? `<span class="sensor-chip" style="${ev.water_level >= 4100 ? 'color: #b45309; background: #fef3c7; border-color: #fde68a;' : 'color: #0284c7; background: #e0f2fe; border-color: #bae6fd;'}">${icons.droplet} Water: ${ev.water_level}${ev.water_level >= 4100 ? ' (Minor)' : ''}</span>` : ""}
+                          ${ev.tilt != null ? `<span class="sensor-chip" style="color: #d97706; background: #fef3c7; border-color: #fde68a;">Tilt: ${ev.tilt}°</span>` : ""}
+                          ${ev.humidity != null ? `<span class="sensor-chip">${icons.droplet} ${ev.humidity}%</span>` : ""}
                           ${ev.vibration != null ? `<span class="sensor-chip">${icons.wind} Vib: ${ev.vibration}</span>` : ""}
                           ${ev.dust != null ? `<span class="sensor-chip">Dust: ${ev.dust}</span>` : ""}
                         </div>
@@ -1503,6 +1519,15 @@ function initRealtime() {
       // Update local camera status directly
       const cam = state.cameras.find((c) => c.id === msg.camera_id);
       if (cam) cam.status = msg.status === "active" ? "online" : "dead";
+      loadInitialData().then(() => renderApp());
+    } else if (msg.type === "telemetry") {
+      // Live telemetry ingestion packet from hardware
+      const cam = state.cameras.find((c) => c.id === msg.camera_id || c.device_id === msg.device_id);
+      if (cam) {
+        cam.status = "online";
+        cam.health_score = msg.health_score;
+        cam.last_seen = new Date().toISOString();
+      }
       loadInitialData().then(() => renderApp());
     }
   });

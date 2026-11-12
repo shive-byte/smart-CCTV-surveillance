@@ -31,14 +31,14 @@ def get_summary(
         )
         cam = cur.fetchone()
 
-        # Event counts
+        # Event counts (only active/unresolved events in dashboard summary)
         cur.execute(
             """
             SELECT
-                COUNT(*) FILTER (WHERE event_type = 'DETECTED')     AS open_events,
-                COUNT(*) FILTER (WHERE severity     = 'CRITICAL')     AS critical_events,
-                COUNT(*) FILTER (WHERE event_type = 'ACKNOWLEDGED') AS acknowledged,
-                COUNT(*)                                               AS total_events
+                COUNT(*) FILTER (WHERE event_status IN ('DETECTED', 'ACKNOWLEDGED') OR event_status IS NULL) AS open_events,
+                COUNT(*) FILTER (WHERE severity = 'CRITICAL' AND (event_status != 'RESOLVED' OR event_status IS NULL)) AS critical_events,
+                COUNT(*) FILTER (WHERE event_status = 'ACKNOWLEDGED') AS acknowledged,
+                COUNT(*) FILTER (WHERE event_status != 'RESOLVED' OR event_status IS NULL) AS total_events
             FROM events
             """
         )
